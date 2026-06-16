@@ -207,3 +207,110 @@ func TestBuildCodexUsageProgressFromExtra_ZerosExpiredWindow(t *testing.T) {
 		}
 	})
 }
+
+func TestParseUpstreamBalanceResponse(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		body      string
+		remaining float64
+		balance   float64
+		unit      string
+	}{
+		{
+			name:      "sub2api top-level remaining",
+			body:      `{"remaining":12.5,"unit":"USD"}`,
+			remaining: 12.5,
+			unit:      "USD",
+		},
+		{
+			name:      "nested quota remaining",
+			body:      `{"quota":{"remaining":"8.75","unit":"CNY"}}`,
+			remaining: 8.75,
+			unit:      "CNY",
+		},
+		{
+			name:    "nested balance",
+			body:    `{"data":{"balance":42}}`,
+			balance: 42,
+			unit:    "USD",
+		},
+	}
+
+	for _, tt := range cases {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := parseV1Usage([]byte(tt.body))
+			if got == nil {
+				t.Fatal("parseUpstreamBalanceResponse() = nil")
+			}
+			if tt.remaining > 0 {
+				if got.Remaining == nil || *got.Remaining != tt.remaining {
+					t.Fatalf("remaining = %v, want %v", got.Remaining, tt.remaining)
+				}
+			}
+			if tt.balance > 0 {
+				if got.Balance == nil || *got.Balance != tt.balance {
+					t.Fatalf("balance = %v, want %v", got.Balance, tt.balance)
+				}
+			}
+			if got.Unit != tt.unit {
+				t.Fatalf("unit = %q, want %q", got.Unit, tt.unit)
+			}
+		})
+	}
+}
+
+func TestParseDashboardBillingBalance(t *testing.T) {
+	t.Parallel()
+
+	info := parseDashboardBilling(
+		map[string]any{"hard_limit_usd": 100.0},
+		map[string]any{"total_usage": 37.5},
+	)
+	if info == nil {
+		t.Fatal("parseDashboardBillingBalance() = nil")
+	}
+	if info.API != "dashboard_billing" {
+		t.Fatalf("api = %q, want dashboard_billing", info.API)
+	}
+	if info.Limit == nil || *info.Limit != 100 {
+		t.Fatalf("limit = %v, want 100", info.Limit)
+	}
+	if info.Used == nil || *info.Used != 37.5 {
+		t.Fatalf("used = %v, want 37.5", info.Used)
+	}
+	if info.Remaining == nil || *info.Remaining != 62.5 {
+		t.Fatalf("remaining = %v, want 62.5", info.Remaining)
+	}
+}
+
+func TestAccountUsageService_GetUsage_AllowsCompatibleAPIKeyBalance(t *testing.T) {
+	account := Account{
+		ID:       42,
+		Platform: PlatformAnthropic,
+		Type:     AccountTypeAPIKey,
+		Credentials: map[string]any{
+			"api_key":  "sk-test",
+			"base_url": "://bad",
+		},
+	}
+	svc := &AccountUsageService{
+		accountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
+		cache:       NewUsageCache(),
+	}
+
+	usage, err := svc.GetUsage(context.Background(), account.ID)
+	if err != nil {
+		t.Fatalf("GetUsage() error = %v", err)
+	}
+	if usage.UpstreamBalance == nil {
+		t.Fatalf("expected upstream balance, got %#v", usage.UpstreamBalance)
+	}
+	if usage.UpstreamBalance.Error == "" {
+		t.Fatalf("expected upstream balance error instead of unsupported account error")
+	}
+}

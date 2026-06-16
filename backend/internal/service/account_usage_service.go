@@ -5,10 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"math/rand/v2"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -176,6 +179,20 @@ type AICredit struct {
 	MinimumBalance float64 `json:"minimum_balance,omitempty"`
 }
 
+// UpstreamBalanceInfo is a cached best-effort balance snapshot for OpenAI-compatible
+// upstreams.
+type UpstreamBalanceInfo struct {
+	Remaining *float64   `json:"remaining,omitempty"`
+	Balance   *float64   `json:"balance,omitempty"`
+	Limit     *float64   `json:"limit,omitempty"`
+	Used      *float64   `json:"used,omitempty"`
+	Unit      string     `json:"unit,omitempty"`
+	API       string     `json:"api,omitempty"`
+	Source    string     `json:"source,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+	Error     string     `json:"error,omitempty"`
+}
+
 // UsageInfo 账号使用量信息
 type UsageInfo struct {
 	Source             string         `json:"source,omitempty"`               // "passive" or "active"
@@ -202,6 +219,9 @@ type UsageInfo struct {
 
 	// Antigravity AI Credits 余额
 	AICredits []AICredit `json:"ai_credits,omitempty"`
+
+	// OpenAI-compatible upstream balance
+	UpstreamBalance *UpstreamBalanceInfo `json:"upstream_balance,omitempty"`
 
 	// Antigravity 废弃模型转发规则 (old_model_id -> new_model_id)
 	ModelForwardingRules map[string]string `json:"model_forwarding_rules,omitempty"`
@@ -305,6 +325,14 @@ func (s *AccountUsageService) GetUsage(ctx context.Context, accountID int64, for
 
 	if account.Platform == PlatformOpenAI && account.Type == AccountTypeOAuth {
 		usage, err := s.getOpenAIUsage(ctx, account, forceProbe)
+		if err == nil {
+			s.tryClearRecoverableAccountError(ctx, account)
+		}
+		return usage, err
+	}
+
+	if isOpenAICompatibleUpstreamUsageAccount(account) {
+		usage, err := s.getOpenAICompatibleUpstreamUsage(ctx, account, forceProbe)
 		if err == nil {
 			s.tryClearRecoverableAccountError(ctx, account)
 		}
@@ -551,6 +579,507 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	}
 
 	return usage, nil
+}
+
+func (s *AccountUsageService) getOpenAICompatibleUpstreamUsage(ctx context.Context, account *Account, force bool) (*UsageInfo, error) {
+	now := time.Now()
+	usage := &UsageInfo{UpdatedAt: &now}
+	if account == nil {
+		return usage, nil
+	}
+
+	if cached := buildUpstreamBalanceFromExtra(account.Extra); cached != nil && !force && !isUpstreamBalanceStale(cached.UpdatedAt, now) {
+		usage.UpstreamBalance = cached
+		return usage, nil
+	}
+
+	balance, err := s.fetchOpenAICompatibleUpstreamBalance(ctx, account)
+	if err != nil {
+		fallback := buildUpstreamBalanceFromExtra(account.Extra)
+		msg := err.Error()
+		if fallback != nil {
+			fallback.Error = msg
+			usage.UpstreamBalance = fallback
+			return usage, nil
+		}
+		usage.UpstreamBalance = &UpstreamBalanceInfo{
+			Source:    "active",
+			UpdatedAt: &now,
+			Error:     msg,
+		}
+		return usage, nil
+	}
+
+	if balance != nil {
+		balance.Source = "active"
+		balance.UpdatedAt = &now
+		usage.UpstreamBalance = balance
+		s.persistUpstreamBalanceSnapshot(account.ID, balance)
+	}
+
+	return usage, nil
+}
+
+func isOpenAICompatibleUpstreamUsageAccount(account *Account) bool {
+	if account == nil {
+		return false
+	}
+	if account.Type != AccountTypeAPIKey && account.Type != AccountTypeUpstream {
+		return false
+	}
+	if account.Platform == PlatformOpenAI {
+		return true
+	}
+	return strings.TrimSpace(account.GetCredential("base_url")) != "" &&
+		strings.TrimSpace(account.GetCredential("api_key")) != ""
+}
+
+func isUpstreamBalanceStale(updatedAt *time.Time, now time.Time) bool {
+	if updatedAt == nil {
+		return true
+	}
+	return now.Sub(*updatedAt) >= 5*time.Minute
+}
+
+func buildUpstreamBalanceFromExtra(extra map[string]any) *UpstreamBalanceInfo {
+	if len(extra) == 0 {
+		return nil
+	}
+	var info UpstreamBalanceInfo
+	if v, ok := parseOptionalExtraFloat64(extra["upstream_balance_remaining"]); ok {
+		info.Remaining = &v
+	}
+	if v, ok := parseOptionalExtraFloat64(extra["upstream_balance"]); ok {
+		info.Balance = &v
+	}
+	if v, ok := parseOptionalExtraFloat64(extra["upstream_balance_limit"]); ok {
+		info.Limit = &v
+	}
+	if v, ok := parseOptionalExtraFloat64(extra["upstream_balance_used"]); ok {
+		info.Used = &v
+	}
+	if raw, ok := extra["upstream_balance_unit"].(string); ok {
+		info.Unit = strings.TrimSpace(raw)
+	}
+	if raw, ok := extra["upstream_balance_api"].(string); ok {
+		info.API = strings.TrimSpace(raw)
+	}
+	if info.Unit == "" {
+		info.Unit = "USD"
+	}
+	if raw, ok := extra["upstream_balance_updated_at"]; ok {
+		if ts, err := parseTime(fmt.Sprint(raw)); err == nil {
+			info.UpdatedAt = &ts
+		}
+	}
+	if info.Remaining == nil && info.Balance == nil && info.Limit == nil && info.Used == nil {
+		return nil
+	}
+	info.Source = "cached"
+	return &info
+}
+
+func parseOptionalExtraFloat64(value any) (float64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	switch v := value.(type) {
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return 0, false
+		}
+	case json.Number:
+		if strings.TrimSpace(v.String()) == "" {
+			return 0, false
+		}
+	}
+	return parseExtraFloat64(value), true
+}
+
+func (s *AccountUsageService) fetchOpenAICompatibleUpstreamBalance(ctx context.Context, account *Account) (*UpstreamBalanceInfo, error) {
+	baseURL := strings.TrimSpace(account.GetCredential("base_url"))
+	if baseURL == "" && account.IsOpenAIApiKey() {
+		baseURL = account.GetOpenAIBaseURL()
+	}
+	apiKey := strings.TrimSpace(account.GetCredential("api_key"))
+	if baseURL == "" || apiKey == "" {
+		return nil, fmt.Errorf("upstream base_url or api_key missing")
+	}
+
+	root, err := upstreamDashboardRoot(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	info, lastErr := fetchV1Usage(ctx, root, apiKey, account)
+	if lastErr == nil {
+		return info, nil
+	}
+	if info, lastErr = fetchV1DashboardBilling(ctx, baseURL, apiKey, account); lastErr == nil {
+		return info, nil
+	}
+	return nil, lastErr
+}
+
+func fetchV1Usage(ctx context.Context, baseURL string, apiKey string, account *Account) (*UpstreamBalanceInfo, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, baseURL+"/v1/usage", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("x-api-key", apiKey)
+
+	proxyURL := ""
+	if account != nil && account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	client, err := httppool.GetClient(httppool.Options{
+		ProxyURL:              proxyURL,
+		Timeout:               10 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream usage returned status %d", resp.StatusCode)
+	}
+	info := parseV1Usage(body)
+	if info == nil {
+		return nil, fmt.Errorf("upstream usage response has no balance")
+	}
+	return info, nil
+}
+
+func parseV1Usage(body []byte) *UpstreamBalanceInfo {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil
+	}
+	info := &UpstreamBalanceInfo{}
+	if v, ok := firstJSONFloat(payload, "remaining", "quota.remaining", "data.remaining", "data.quota.remaining"); ok {
+		info.Remaining = &v
+	}
+	if v, ok := firstJSONFloat(payload, "balance", "quota.balance", "data.balance", "data.quota.balance"); ok {
+		info.Balance = &v
+	}
+	if v, ok := firstJSONFloat(payload, "limit", "quota.limit", "data.limit", "data.quota.limit"); ok {
+		info.Limit = &v
+	}
+	if v, ok := firstJSONFloat(payload, "used", "quota.used", "data.used", "data.quota.used", "usage", "data.usage", "total_usage", "data.total_usage", "usage.total.actual_cost"); ok {
+		info.Used = &v
+	}
+	if unit, ok := firstJSONString(payload, "unit", "quota.unit", "data.unit", "data.quota.unit"); ok {
+		info.Unit = unit
+	}
+	if info.Unit == "" {
+		info.Unit = "USD"
+	}
+	if info.Remaining == nil && info.Balance == nil && info.Limit == nil && info.Used == nil {
+		return nil
+	}
+	if info.Remaining == nil && info.Limit != nil && info.Used != nil {
+		remaining := *info.Limit - *info.Used
+		if remaining < 0 {
+			remaining = 0
+		}
+		info.Remaining = &remaining
+	}
+	info.API = "v1_usage"
+	return info
+}
+
+func fetchV1DashboardBilling(ctx context.Context, baseURL, apiKey string, account *Account) (*UpstreamBalanceInfo, error) {
+	root, err := upstreamDashboardRoot(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	subscription, err := fetchFirstUpstreamJSON(ctx, dashboardBillingSubscriptionURLs(root), apiKey, account)
+	if err != nil {
+		return nil, fmt.Errorf("dashboard billing subscription failed: %w", err)
+	}
+
+	usage, usageErr := fetchDashboardBillingUsage(ctx, dashboardBillingUsageURLs(root), apiKey, account)
+
+	info := parseDashboardBilling(subscription, usage)
+	if info == nil {
+		if usageErr != nil {
+			return nil, fmt.Errorf("dashboard billing response has no quota: %w", usageErr)
+		}
+		return nil, fmt.Errorf("dashboard billing response has no quota")
+	}
+	if usageErr != nil {
+		info.Error = usageErr.Error()
+	}
+	return info, nil
+}
+
+func upstreamDashboardRoot(baseURL string) (string, error) {
+	parsed, err := url.Parse(strings.TrimSpace(baseURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("invalid upstream base_url")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	parsed.Path = strings.TrimRight(parsed.Path, "/")
+	if before, ok := strings.CutSuffix(parsed.Path, "/v1"); ok {
+		parsed.Path = before
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func dashboardBillingSubscriptionURLs(root string) []string {
+	return []string{
+		root + "/dashboard/billing/subscription",
+		root + "/v1/dashboard/billing/subscription",
+	}
+}
+
+func dashboardBillingUsageURLs(root string) []string {
+	now := time.Now().UTC()
+	values := url.Values{}
+	values.Set("start_date", "2000-01-01")
+	values.Set("end_date", now.Format("2006-01-02"))
+	query := values.Encode()
+	return []string{
+		root + "/dashboard/billing/usage?" + query,
+		root + "/v1/dashboard/billing/usage?" + query,
+		root + "/v1/dashboard/billing/usage",
+	}
+}
+
+func fetchFirstUpstreamJSON(ctx context.Context, endpoints []string, apiKey string, account *Account) (map[string]any, error) {
+	var lastErr error
+	for _, endpoint := range endpoints {
+		payload, err := fetchUpstreamJSON(ctx, endpoint, apiKey, account)
+		if err == nil {
+			return payload, nil
+		}
+		lastErr = err
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no upstream billing endpoint")
+	}
+	return nil, lastErr
+}
+
+func fetchDashboardBillingUsage(ctx context.Context, endpoints []string, apiKey string, account *Account) (map[string]any, error) {
+	merged := make(map[string]any)
+	var lastErr error
+	success := false
+	for _, endpoint := range endpoints {
+		payload, err := fetchUpstreamJSON(ctx, endpoint, apiKey, account)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		success = true
+		mergeJSONMap(merged, payload)
+		if hasAnyJSONFloat(merged,
+			"total_usage", "data.total_usage", "used", "data.used", "usage", "data.usage",
+			"remaining", "data.remaining", "balance", "data.balance", "quota.remaining", "data.quota.remaining",
+		) {
+			continue
+		}
+	}
+	if success {
+		return merged, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no upstream billing usage endpoint")
+	}
+	return nil, lastErr
+}
+
+func mergeJSONMap(dst, src map[string]any) {
+	for key, value := range src {
+		if existing, ok := dst[key].(map[string]any); ok {
+			if incoming, ok := value.(map[string]any); ok {
+				mergeJSONMap(existing, incoming)
+				continue
+			}
+		}
+		dst[key] = value
+	}
+}
+
+func hasAnyJSONFloat(payload map[string]any, paths ...string) bool {
+	_, ok := firstJSONFloat(payload, paths...)
+	return ok
+}
+
+func fetchUpstreamJSON(ctx context.Context, endpoint, apiKey string, account *Account) (map[string]any, error) {
+	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("x-api-key", apiKey)
+
+	proxyURL := ""
+	if account != nil && account.ProxyID != nil && account.Proxy != nil {
+		proxyURL = account.Proxy.URL()
+	}
+	client, err := httppool.GetClient(httppool.Options{
+		ProxyURL:              proxyURL,
+		Timeout:               10 * time.Second,
+		ResponseHeaderTimeout: 8 * time.Second,
+	})
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("upstream billing returned status %d", resp.StatusCode)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
+}
+
+func parseDashboardBilling(subscription, usage map[string]any) *UpstreamBalanceInfo {
+	info := &UpstreamBalanceInfo{
+		Unit: "USD",
+		API:  "v1_dashboard_billing",
+	}
+	if v, ok := firstJSONFloat(subscription, "hard_limit_usd", "hard_limit", "soft_limit_usd", "soft_limit", "system_hard_limit_usd", "system_hard_limit", "data.hard_limit_usd", "data.hard_limit", "data.soft_limit_usd", "data.soft_limit"); ok {
+		info.Limit = &v
+	}
+	if unit, ok := firstJSONString(subscription, "unit", "currency", "data.unit", "data.currency"); ok {
+		info.Unit = unit
+	}
+	if v, ok := firstJSONFloat(usage, "total_usage", "data.total_usage", "used", "data.used", "usage", "data.usage"); ok {
+		info.Used = &v
+	}
+	if v, ok := firstJSONFloat(usage, "remaining", "data.remaining", "balance", "data.balance", "quota.remaining", "data.quota.remaining"); ok {
+		info.Remaining = &v
+	}
+	if info.Remaining == nil && info.Limit != nil && info.Used != nil {
+		remaining := *info.Limit - *info.Used
+		if remaining < 0 {
+			remaining = 0
+		}
+		info.Remaining = &remaining
+	}
+	if info.Limit == nil && info.Used == nil && info.Remaining == nil {
+		return nil
+	}
+	return info
+}
+
+func firstJSONFloat(payload map[string]any, paths ...string) (float64, bool) {
+	for _, path := range paths {
+		if v, ok := getNestedJSONValue(payload, path); ok {
+			if parsed, ok := parseJSONFloat(v); ok {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func firstJSONString(payload map[string]any, paths ...string) (string, bool) {
+	for _, path := range paths {
+		if v, ok := getNestedJSONValue(payload, path); ok {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s), true
+			}
+		}
+	}
+	return "", false
+}
+
+func getNestedJSONValue(payload map[string]any, path string) (any, bool) {
+	var current any = payload
+	for _, part := range strings.Split(path, ".") {
+		m, ok := current.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		current, ok = m[part]
+		if !ok {
+			return nil, false
+		}
+	}
+	return current, true
+}
+
+func parseJSONFloat(value any) (float64, bool) {
+	switch v := value.(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	case json.Number:
+		f, err := v.Float64()
+		return f, err == nil
+	case string:
+		if strings.TrimSpace(v) == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (s *AccountUsageService) persistUpstreamBalanceSnapshot(accountID int64, balance *UpstreamBalanceInfo) {
+	if s == nil || s.accountRepo == nil || accountID <= 0 || balance == nil {
+		return
+	}
+	updates := map[string]any{
+		"upstream_balance_unit":       balance.Unit,
+		"upstream_balance_updated_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	if balance.API != "" {
+		updates["upstream_balance_api"] = balance.API
+	}
+	if balance.Remaining != nil {
+		updates["upstream_balance_remaining"] = *balance.Remaining
+	}
+	if balance.Balance != nil {
+		updates["upstream_balance"] = *balance.Balance
+	}
+	if balance.Limit != nil {
+		updates["upstream_balance_limit"] = *balance.Limit
+	}
+	if balance.Used != nil {
+		updates["upstream_balance_used"] = *balance.Used
+	}
+	go func() {
+		updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer updateCancel()
+		_ = s.accountRepo.UpdateExtra(updateCtx, accountID, updates)
+	}()
 }
 
 func shouldRefreshOpenAICodexSnapshot(account *Account, usage *UsageInfo, now time.Time) bool {

@@ -914,10 +914,25 @@ export interface Account {
   quota_daily_reset_at?: string | null
   quota_weekly_reset_at?: string | null
 
+  // Cached upstream balance for OpenAI-compatible upstreams
+  upstream_balance?: UpstreamBalanceInfo | null
+
   // 运行时状态（仅当启用对应限制时返回）
   current_window_cost?: number | null // 当前窗口费用
   active_sessions?: number | null // 当前活跃会话数
   current_rpm?: number | null // 当前分钟 RPM 计数
+}
+
+export interface UpstreamBalanceInfo {
+  remaining?: number | null
+  balance?: number | null
+  limit?: number | null
+  used?: number | null
+  unit?: string
+  api?: string
+  source?: 'cached' | 'active' | string
+  updated_at?: string | null
+  error?: string
 }
 
 // Account Usage types
@@ -962,6 +977,7 @@ export interface AccountUsageInfo {
     amount?: number
     minimum_balance?: number
   }> | null
+  upstream_balance?: UpstreamBalanceInfo | null
   // Antigravity 403 forbidden 状态
   is_forbidden?: boolean
   forbidden_reason?: string

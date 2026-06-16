@@ -431,6 +431,38 @@
     <AccountQuotaInfo v-if="account.platform === 'gemini'" :account="account" />
     <!-- Key/Bedrock accounts: show today stats + optional quota bars -->
     <div v-else class="space-y-1">
+      <div
+        v-if="upstreamBalanceDisplay || upstreamUsedDisplay"
+        class="flex items-center gap-1.5 text-[9px]"
+        :title="upstreamBalanceTitle"
+      >
+        <span
+          v-if="upstreamBalanceDisplay"
+          class="rounded bg-emerald-50 px-1.5 py-0.5 font-medium text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300"
+          :title="upstreamRemainingTitle"
+        >
+          {{ upstreamBalanceDisplay }}
+        </span>
+        <span
+          v-if="upstreamUsedDisplay"
+          class="rounded bg-sky-50 px-1.5 py-0.5 font-medium text-sky-700 dark:bg-sky-900/30 dark:text-sky-300"
+          :title="upstreamUsedTitle"
+        >
+          {{ upstreamUsedDisplay }}
+        </span>
+      </div>
+      <div
+        v-else-if="shouldFetchUpstreamBalance && loading"
+        class="h-3 w-20 animate-pulse rounded bg-gray-200 dark:bg-gray-700"
+      ></div>
+      <div
+        v-else-if="upstreamBalanceError"
+        class="max-w-[180px] truncate text-[10px] text-amber-600 dark:text-amber-400"
+        :title="upstreamBalanceError"
+      >
+        {{ upstreamBalanceError }}
+      </div>
+
       <!-- Today stats row (requests, tokens, cost, user_cost) -->
       <div
         v-if="todayStats"
@@ -488,7 +520,7 @@
       />
 
       <!-- No data at all -->
-      <div v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota" class="text-xs text-gray-400">-</div>
+      <div v-if="!todayStats && !todayStatsLoading && !hasApiKeyQuota && !hasUpstreamQuotaInfo" class="text-xs text-gray-400">-</div>
     </div>
   </div>
 </template>
@@ -567,6 +599,14 @@ const shouldFetchUsage = computed(() => {
   return false
 })
 
+const shouldFetchUpstreamBalance = computed(() => {
+  if (props.account.type !== 'apikey' && props.account.type !== 'upstream') return false
+  if (props.account.platform === 'openai') return true
+  return !!props.account.credentials?.base_url && props.account.credentials_status?.has_api_key === true
+})
+
+const shouldLoadUsageData = computed(() => shouldFetchUsage.value || shouldFetchUpstreamBalance.value)
+
 const showGeminiTodayStats = computed(() => {
   return props.account.platform === 'gemini' && props.account.type === 'service_account'
 })
@@ -590,11 +630,11 @@ const hasOpenAIUsageFallback = computed(() => {
 const openAIUsageRefreshKey = computed(() => buildOpenAIUsageRefreshKey(props.account))
 
 const shouldAutoLoadUsageOnMount = computed(() => {
-  return shouldFetchUsage.value
+  return shouldLoadUsageData.value
 })
 
 const shouldLazyLoadOnMobile = computed(() => {
-  return shouldFetchUsage.value && !isDesktopViewport.value
+  return shouldLoadUsageData.value && !isDesktopViewport.value
 })
 
 // Antigravity quota types (用于 API 返回的数据)
@@ -675,6 +715,73 @@ const aiCreditsDisplay = computed(() => {
   const total = credits.reduce((sum, credit) => sum + (credit.amount ?? 0), 0)
   if (total <= 0) return null
   return total.toFixed(0)
+})
+
+const effectiveUpstreamBalance = computed(() => {
+  return usageInfo.value?.upstream_balance || props.account.upstream_balance || null
+})
+
+const upstreamBalanceValue = computed(() => {
+  const balance = effectiveUpstreamBalance.value
+  if (!balance) return null
+  if (typeof balance.remaining === 'number') return balance.remaining
+  if (typeof balance.balance === 'number') return balance.balance
+  if (typeof balance.limit === 'number') return balance.limit
+  return null
+})
+
+const formatUpstreamMoney = (value: number, unit?: string) => {
+  const normalizedUnit = (unit || 'USD').trim() || 'USD'
+  if (normalizedUnit.toUpperCase() === 'USD') {
+    return `$${value.toFixed(2)}`
+  }
+  return `${value.toFixed(2)} ${normalizedUnit}`
+}
+
+const upstreamBalanceDisplay = computed(() => {
+  const value = upstreamBalanceValue.value
+  if (value === null) return null
+  return formatUpstreamMoney(value, effectiveUpstreamBalance.value?.unit)
+})
+
+const upstreamUsedDisplay = computed(() => {
+  const balance = effectiveUpstreamBalance.value
+  if (!balance || typeof balance.used !== 'number') return null
+  return formatUpstreamMoney(balance.used, balance.unit)
+})
+
+const upstreamBalanceError = computed(() => {
+  return effectiveUpstreamBalance.value?.error || null
+})
+
+const hasUpstreamQuotaInfo = computed(() => {
+  return !!upstreamBalanceDisplay.value || !!upstreamUsedDisplay.value || !!upstreamBalanceError.value
+})
+
+const upstreamBalanceTitle = computed(() => {
+  const balance = effectiveUpstreamBalance.value
+  if (!balance) return ''
+  const parts: string[] = []
+  if (balance.api) parts.push(balance.api)
+  if (balance.source) parts.push(balance.source)
+  if (balance.updated_at) parts.push(balance.updated_at)
+  return parts.join(' · ')
+})
+
+const upstreamRemainingTitle = computed(() => {
+  const parts = [t('admin.accounts.upstreamRemaining')]
+  const meta = upstreamBalanceTitle.value
+  if (meta) parts.push(meta)
+  return parts.join(' · ')
+})
+
+const upstreamUsedTitle = computed(() => {
+  const parts = [t('admin.accounts.upstreamUsed')]
+  const balance = effectiveUpstreamBalance.value
+  if (balance?.limit != null) parts.push(`${t('admin.accounts.upstreamLimit')} ${formatUpstreamMoney(balance.limit, balance.unit)}`)
+  const meta = upstreamBalanceTitle.value
+  if (meta) parts.push(meta)
+  return parts.join(' · ')
 })
 
 // Antigravity 账户类型（从 load_code_assist 响应中提取）
@@ -1011,7 +1118,7 @@ const isAnthropicOAuthOrSetupToken = computed(() => {
 })
 
 const loadUsage = async (options?: { source?: 'passive' | 'active'; bypassCache?: boolean }) => {
-  if (!shouldFetchUsage.value) return
+  if (!shouldLoadUsageData.value) return
 
   // Check cache
   if (!options?.bypassCache) {
@@ -1054,7 +1161,7 @@ const flushPendingAutoLoad = () => {
 }
 
 const requestAutoLoad = (source?: 'passive' | 'active') => {
-  if (!shouldFetchUsage.value) return
+  if (!shouldLoadUsageData.value) return
   if (shouldLazyLoadOnMobile.value && !hasEnteredViewport.value) {
     pendingAutoLoad.value = true
     pendingAutoLoadSource.value = source
@@ -1221,7 +1328,7 @@ watch(
   () => props.manualRefreshToken,
   (nextToken, prevToken) => {
     if (nextToken === prevToken) return
-    if (!shouldFetchUsage.value) return
+    if (!shouldLoadUsageData.value) return
 
     const source = isAnthropicOAuthOrSetupToken.value ? 'passive' : undefined
     _usageCache.delete(props.account.id)

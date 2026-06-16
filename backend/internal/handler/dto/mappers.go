@@ -2,7 +2,10 @@
 package dto
 
 import (
+	"encoding/json"
+	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -236,6 +239,12 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		GroupIDs:                a.GroupIDs,
 	}
 
+	if isOpenAICompatibleUpstreamBalanceAccount(a) {
+		if balance := upstreamBalanceFromExtra(a.Extra); balance != nil {
+			out.UpstreamBalance = balance
+		}
+	}
+
 	// 提取 5h 窗口费用控制和会话数量控制配置（仅 Anthropic OAuth/SetupToken 账号有效）
 	if a.IsAnthropicOAuthOrSetupToken() {
 		if limit := a.GetWindowCostLimit(); limit > 0 {
@@ -363,6 +372,86 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 	}
 
 	return out
+}
+
+func upstreamBalanceFromExtra(extra map[string]any) *UpstreamBalanceInfo {
+	if len(extra) == 0 {
+		return nil
+	}
+	info := &UpstreamBalanceInfo{Unit: "USD", Source: "cached"}
+	if v, ok := extra["upstream_balance_remaining"]; ok {
+		if parsed, ok := parseDTOFloat(v); ok {
+			info.Remaining = &parsed
+		}
+	}
+	if v, ok := extra["upstream_balance"]; ok {
+		if parsed, ok := parseDTOFloat(v); ok {
+			info.Balance = &parsed
+		}
+	}
+	if v, ok := extra["upstream_balance_limit"]; ok {
+		if parsed, ok := parseDTOFloat(v); ok {
+			info.Limit = &parsed
+		}
+	}
+	if v, ok := extra["upstream_balance_used"]; ok {
+		if parsed, ok := parseDTOFloat(v); ok {
+			info.Used = &parsed
+		}
+	}
+	if unit, ok := extra["upstream_balance_unit"].(string); ok && strings.TrimSpace(unit) != "" {
+		info.Unit = strings.TrimSpace(unit)
+	}
+	if api, ok := extra["upstream_balance_api"].(string); ok && strings.TrimSpace(api) != "" {
+		info.API = strings.TrimSpace(api)
+	}
+	if raw, ok := extra["upstream_balance_updated_at"]; ok {
+		if ts, err := time.Parse(time.RFC3339, fmt.Sprint(raw)); err == nil {
+			info.UpdatedAt = &ts
+		}
+	}
+	if errText, ok := extra["upstream_balance_error"].(string); ok && strings.TrimSpace(errText) != "" {
+		info.Error = strings.TrimSpace(errText)
+	}
+	if info.Remaining == nil && info.Balance == nil && info.Limit == nil && info.Used == nil && info.Error == "" {
+		return nil
+	}
+	return info
+}
+
+func isOpenAICompatibleUpstreamBalanceAccount(a *service.Account) bool {
+	if a.Type != service.AccountTypeAPIKey && a.Type != service.AccountTypeUpstream {
+		return false
+	}
+	if a.IsOpenAI() {
+		return true
+	}
+	return strings.TrimSpace(a.GetCredential("base_url")) != "" &&
+		strings.TrimSpace(a.GetCredential("api_key")) != ""
+}
+
+func parseDTOFloat(v any) (float64, bool) {
+	switch value := v.(type) {
+	case float64:
+		return value, true
+	case float32:
+		return float64(value), true
+	case int:
+		return float64(value), true
+	case int64:
+		return float64(value), true
+	case json.Number:
+		f, err := value.Float64()
+		return f, err == nil
+	case string:
+		if strings.TrimSpace(value) == "" {
+			return 0, false
+		}
+		f, err := strconv.ParseFloat(strings.TrimSpace(value), 64)
+		return f, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func AccountFromService(a *service.Account) *Account {

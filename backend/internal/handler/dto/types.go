@@ -253,11 +253,26 @@ type Account struct {
 	QuotaNotifyTotalEnabled    *bool    `json:"quota_notify_total_enabled,omitempty"`
 	QuotaNotifyTotalThreshold  *float64 `json:"quota_notify_total_threshold,omitempty"`
 
+	// 上游余额缓存（OpenAI-compatible 上游）
+	UpstreamBalance *UpstreamBalanceInfo `json:"upstream_balance,omitempty"`
+
 	Proxy         *Proxy         `json:"proxy,omitempty"`
 	AccountGroups []AccountGroup `json:"account_groups,omitempty"`
 
 	GroupIDs []int64  `json:"group_ids,omitempty"`
 	Groups   []*Group `json:"groups,omitempty"`
+}
+
+type UpstreamBalanceInfo struct {
+	Remaining *float64   `json:"remaining,omitempty"`
+	Balance   *float64   `json:"balance,omitempty"`
+	Limit     *float64   `json:"limit,omitempty"`
+	Used      *float64   `json:"used,omitempty"`
+	Unit      string     `json:"unit,omitempty"`
+	API       string     `json:"api,omitempty"`
+	Source    string     `json:"source,omitempty"`
+	UpdatedAt *time.Time `json:"updated_at,omitempty"`
+	Error     string     `json:"error,omitempty"`
 }
 
 type AccountGroup struct {
